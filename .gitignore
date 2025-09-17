@@ -1,0 +1,12 @@
+**/venv/*
+**/__pycache__/*
+**/node_modules/*
+**/.next/*
+**/.env
+.vscode/*
+exchange-ews-connector/function/*
+exchange-ews-connector/layer/*
+exchange-ews-connector/*.zip
+exchange-ews-connector/config.json
+exchange-ews-connector/=*
+.repolinter.json
