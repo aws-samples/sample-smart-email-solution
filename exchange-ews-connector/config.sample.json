@@ -1,0 +1,14 @@
+{
+  "exchange": {
+    "client_id": "",
+    "client_secret": "",
+    "tenant_id": "",
+    "primary_smtp_address": "",
+    "server": "outlook.office365.com"
+  },
+  "qbusiness": {
+    "application_id": "",
+    "index_id": "",
+    "datasource_id": ""
+  }
+}

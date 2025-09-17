@@ -1,0 +1,143 @@
+# Third-Party Licenses
+
+This document lists the open source software libraries used in the Nova Sonic Next.js + FastAPI Demo project and their respective licenses.
+
+## Backend Dependencies (Python)
+
+### FastAPI
+- **License**: MIT License
+- **Repository**: https://github.com/tiangolo/fastapi
+- **Description**: Modern, fast web framework for building APIs with Python
+
+### Uvicorn
+- **License**: BSD 3-Clause License
+- **Repository**: https://github.com/encode/uvicorn
+- **Description**: Lightning-fast ASGI server implementation
+
+### WebSockets
+- **License**: BSD 3-Clause License
+- **Repository**: https://github.com/python-websockets/websockets
+- **Description**: Library for building WebSocket servers and clients in Python
+
+### Python-multipart
+- **License**: Apache License 2.0
+- **Repository**: https://github.com/andrew-d/python-multipart
+- **Description**: Streaming multipart parser for Python
+
+### PyAudio
+- **License**: MIT License
+- **Repository**: https://github.com/intxcc/pyaudio_portaudio
+- **Description**: Python bindings for PortAudio, a cross-platform audio I/O library
+
+### urllib3
+- **License**: MIT License
+- **Repository**: https://github.com/urllib3/urllib3
+- **Description**: HTTP library with thread-safe connection pooling, file post, and more
+
+### Smithy Core
+- **License**: Apache License 2.0
+- **Repository**: https://github.com/smithy-lang/smithy-python
+- **Description**: Transport-agnostic core modules and interfaces for building service clients
+
+### Smithy HTTP
+- **License**: Apache License 2.0
+- **Repository**: https://github.com/smithy-lang/smithy-python
+- **Description**: HTTP core modules and interfaces for building HTTP service clients
+
+### Smithy JSON
+- **License**: Apache License 2.0
+- **Repository**: https://github.com/smithy-lang/smithy-python
+- **Description**: JSON serialization and deserialization for Smithy clients
+
+### Smithy AWS Core
+- **License**: Apache License 2.0
+- **Repository**: https://github.com/smithy-lang/smithy-python
+- **Description**: AWS-specific implementations of Smithy core interfaces
+
+### Smithy AWS Event Stream
+- **License**: Apache License 2.0
+- **Repository**: https://github.com/smithy-lang/smithy-python
+- **Description**: AWS Event Stream support for Smithy clients
+
+## Frontend Dependencies (JavaScript/TypeScript)
+
+### React
+- **License**: MIT License
+- **Repository**: https://github.com/facebook/react
+- **Description**: JavaScript library for building user interfaces
+
+### Next.js
+- **License**: MIT License
+- **Repository**: https://github.com/vercel/next.js
+- **Description**: React framework for production applications
+
+### Radix UI Components
+- **License**: MIT License
+- **Repository**: https://github.com/radix-ui/primitives
+- **Components Used**: Avatar, Separator, Slider, Slot
+- **Description**: Low-level UI primitives and components
+
+### Tailwind CSS
+- **License**: MIT License
+- **Repository**: https://github.com/tailwindlabs/tailwindcss
+- **Description**: Utility-first CSS framework
+
+### Framer Motion
+- **License**: MIT License
+- **Repository**: https://github.com/framer/motion
+- **Description**: Production-ready motion library for React
+
+### Lucide React
+- **License**: ISC License
+- **Repository**: https://github.com/lucide-icons/lucide
+- **Description**: Beautiful & consistent icon toolkit
+
+### TypeScript
+- **License**: Apache License 2.0
+- **Repository**: https://github.com/microsoft/TypeScript
+- **Description**: Typed superset of JavaScript
+
+### Class Variance Authority (CVA)
+- **License**: Apache License 2.0
+- **Repository**: https://github.com/joe-bell/cva
+- **Description**: Utility for creating type-safe component variants
+
+### clsx
+- **License**: MIT License
+- **Repository**: https://github.com/lukeed/clsx
+- **Description**: Utility for constructing className strings conditionally
+
+### Tailwind Merge
+- **License**: MIT License
+- **Repository**: https://github.com/dcastil/tailwind-merge
+- **Description**: Utility function to merge Tailwind CSS classes
+
+## Development Dependencies
+
+### ESLint
+- **License**: MIT License
+- **Repository**: https://github.com/eslint/eslint
+- **Description**: Tool for identifying and reporting on patterns in JavaScript
+
+### PostCSS
+- **License**: MIT License
+- **Repository**: https://github.com/postcss/postcss
+- **Description**: Tool for transforming CSS with JavaScript
+
+### tw-animate-css
+- **License**: MIT License
+- **Repository**: https://github.com/tailwindlabs/tailwindcss-animate
+- **Description**: Tailwind CSS plugin for animations
+
+## License Types Summary
+
+- **MIT License**: FastAPI, Uvicorn, PyAudio, urllib3, React, Next.js, Radix UI, Tailwind CSS, Framer Motion, clsx, Tailwind Merge, ESLint, PostCSS, tw-animate-css
+- **BSD 3-Clause License**: Uvicorn, WebSockets
+- **Apache License 2.0**: Python-multipart, TypeScript, Class Variance Authority, Smithy Core, Smithy HTTP, Smithy JSON, Smithy AWS Core, Smithy AWS Event Stream
+- **ISC License**: Lucide React
+
+## Notice
+
+This project is a demonstration/sample application. All third-party libraries are used in accordance with their respective licenses. For complete license texts, please refer to the individual repositories listed above.
+
+---
