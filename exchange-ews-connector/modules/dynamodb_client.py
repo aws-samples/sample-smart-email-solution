@@ -53,32 +53,22 @@ class DynamoDBClient:
                 TableName=self.config.table_name,
                 KeySchema=[
                     {
-                        'AttributeName': 'email_id',
+                        'AttributeName': 'account_email',
                         'KeyType': 'HASH'
+                    },
+                    {
+                        'AttributeName': 'folder_email_key',
+                        'KeyType': 'RANGE'
                     }
                 ],
                 AttributeDefinitions=[
                     {
-                        'AttributeName': 'email_id',
+                        'AttributeName': 'account_email',
                         'AttributeType': 'S'
                     },
                     {
-                        'AttributeName': 'account_email',
+                        'AttributeName': 'folder_email_key',
                         'AttributeType': 'S'
-                    }
-                ],
-                GlobalSecondaryIndexes=[
-                    {
-                        'IndexName': 'account-email-index',
-                        'KeySchema': [
-                            {
-                                'AttributeName': 'account_email',
-                                'KeyType': 'HASH'
-                            }
-                        ],
-                        'Projection': {
-                            'ProjectionType': 'ALL'
-                        }
                     }
                 ],
                 BillingMode='PAY_PER_REQUEST',
@@ -120,48 +110,45 @@ class DynamoDBClient:
         except Exception as e:
             raise Exception(f"Unexpected error creating DynamoDB table '{self.config.table_name}': {e}")
     
-    def is_email_processed(self, email_id: str) -> bool:
+    def _create_folder_email_key(self, folder_path: str, email_id: str) -> str:
+        """Create sort key from folder_path and email_id"""
+        return f"{folder_path}#{email_id}"
+    
+    def _extract_email_id_from_folder_email_key(self, folder_email_key: str) -> str:
+        """Extract email_id from folder_email_key"""
+        parts = folder_email_key.split('#')
+        return parts[-1] if len(parts) >= 2 else ''
+    
+    def _extract_folder_from_folder_email_key(self, folder_email_key: str) -> str:
+        """Extract folder_path from folder_email_key"""
+        parts = folder_email_key.split('#')
+        return parts[0] if len(parts) >= 2 else ''
+    
+    def is_email_processed(self, email_id: str, account_email: str, folder_path: str) -> bool:
         """Check if email ID has been processed"""
         try:
             self._ensure_table_exists()
-            response = self.table.get_item(Key={'email_id': str(email_id)})
+            folder_email_key = self._create_folder_email_key(folder_path, email_id)
+            response = self.table.get_item(Key={
+                'account_email': account_email,
+                'folder_email_key': folder_email_key
+            })
             return 'Item' in response
         except ClientError:
             return False
     
-    def get_email_processing_info(self, email_id: str) -> dict:
+    def get_email_processing_info(self, email_id: str, account_email: str, folder_path: str) -> dict:
         """Get processing information for an email"""
         try:
             self._ensure_table_exists()
-            response = self.table.get_item(Key={'email_id': str(email_id)})
+            folder_email_key = self._create_folder_email_key(folder_path, email_id)
+            response = self.table.get_item(Key={
+                'account_email': account_email,
+                'folder_email_key': folder_email_key
+            })
             return response.get('Item', {})
         except ClientError:
             return {}
-    
-    def needs_update(self, email_id: str, last_modified_time) -> bool:
-        """Check if an email needs to be updated based on last modified time"""
-        try:
-            processing_info = self.get_email_processing_info(email_id)
-            if not processing_info:
-                return True  # Not processed yet, needs processing
-            
-            # Get the stored datetime_created (when we last processed it)
-            stored_datetime = processing_info.get('datetime_created', '')
-            if not stored_datetime:
-                return True  # No stored datetime, needs processing
-            
-            # Compare with current last_modified_time
-            if last_modified_time and hasattr(last_modified_time, 'isoformat'):
-                current_modified = last_modified_time.isoformat()
-                # If the email was modified after we last processed it, it needs update
-                return current_modified > stored_datetime
-            
-            return False  # Can't determine, assume no update needed
-            
-        except Exception as e:
-            error_msg = handle_error_securely(e, "checking if email needs update")
-            logger.error(error_msg)
-            return True  # On error, assume it needs processing
     
     def mark_email_processed(self, email_id: str, folder_name: str, datetime_created, 
                            status: str = 'processed', account_email: str = None) -> bool:
@@ -171,19 +158,26 @@ class DynamoDBClient:
             email_id_str = str(email_id)
             current_time = datetime.now(timezone.utc).isoformat()
             
+            if not account_email:
+                raise ValueError("account_email is required")
+            
+            # Create folder_email_key
+            folder_email_key = self._create_folder_email_key(folder_name, email_id_str)
+            
             # Use update_item to handle both new items and updates to existing items
             response = self.table.update_item(
-                Key={'email_id': email_id_str},
-                UpdateExpression='SET folder_name = :folder, datetime_created = :created, processed_at = :processed, #status = :status, account_email = :account, attempt_count = if_not_exists(attempt_count, :zero) + :one',
+                Key={
+                    'account_email': account_email,
+                    'folder_email_key': folder_email_key
+                },
+                UpdateExpression='SET datetime_created = :created, processed_at = :processed, #status = :status, attempt_count = if_not_exists(attempt_count, :zero) + :one',
                 ExpressionAttributeNames={
                     '#status': 'status'  # 'status' is a reserved word in DynamoDB
                 },
                 ExpressionAttributeValues={
-                    ':folder': folder_name,
                     ':created': str(datetime_created),
                     ':processed': current_time,
                     ':status': status,
-                    ':account': account_email or 'unknown',
                     ':zero': 0,
                     ':one': 1
                 },
@@ -206,32 +200,48 @@ class DynamoDBClient:
             logger.error(error_msg)
             return False
     
-    def get_processed_email_ids_for_folder(self, folder_name: str) -> Set[str]:
+    def get_processed_email_ids_for_folder(self, folder_name: str, account_email: str) -> Set[str]:
         """Get email IDs from DynamoDB that have been processed for a specific folder"""
         try:
             self._ensure_table_exists()
             processed_ids = set()
             
-            response = self.table.scan(
-                FilterExpression='folder_name = :folder_name',
-                ExpressionAttributeValues={':folder_name': folder_name}
+            # Create prefix for folder_email_key: folder_name#
+            folder_prefix = f"{folder_name}#"
+            
+            # Use efficient query with begins_with on sort key
+            response = self.table.query(
+                KeyConditionExpression='account_email = :account AND begins_with(folder_email_key, :folder_prefix)',
+                ExpressionAttributeValues={
+                    ':account': account_email,
+                    ':folder_prefix': folder_prefix
+                }
             )
             
             for item in response['Items']:
-                processed_ids.add(item['email_id'])
+                folder_email_key = item.get('folder_email_key', '')
+                email_id = self._extract_email_id_from_folder_email_key(folder_email_key)
+                if email_id:
+                    processed_ids.add(email_id)
             
             while 'LastEvaluatedKey' in response:
-                response = self.table.scan(
-                    FilterExpression='folder_name = :folder_name',
-                    ExpressionAttributeValues={':folder_name': folder_name},
+                response = self.table.query(
+                    KeyConditionExpression='account_email = :account AND begins_with(folder_email_key, :folder_prefix)',
+                    ExpressionAttributeValues={
+                        ':account': account_email,
+                        ':folder_prefix': folder_prefix
+                    },
                     ExclusiveStartKey=response['LastEvaluatedKey']
                 )
                 for item in response['Items']:
-                    processed_ids.add(item['email_id'])
+                    folder_email_key = item.get('folder_email_key', '')
+                    email_id = self._extract_email_id_from_folder_email_key(folder_email_key)
+                    if email_id:
+                        processed_ids.add(email_id)
             
             return processed_ids
         except ClientError as e:
-            error_msg = handle_error_securely(e, f"scanning DynamoDB table for folder {sanitize_for_logging(folder_name)}")
+            error_msg = handle_error_securely(e, f"querying DynamoDB table for folder {sanitize_for_logging(folder_name)}")
             logger.error(error_msg)
             return set()
     
@@ -243,12 +253,18 @@ class DynamoDBClient:
             response = self.table.scan()
             
             for item in response['Items']:
-                processed_ids.add(item['email_id'])
+                folder_email_key = item.get('folder_email_key', '')
+                email_id = self._extract_email_id_from_folder_email_key(folder_email_key)
+                if email_id:
+                    processed_ids.add(email_id)
             
             while 'LastEvaluatedKey' in response:
                 response = self.table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
                 for item in response['Items']:
-                    processed_ids.add(item['email_id'])
+                    folder_email_key = item.get('folder_email_key', '')
+                    email_id = self._extract_email_id_from_folder_email_key(folder_email_key)
+                    if email_id:
+                        processed_ids.add(email_id)
             
             return processed_ids
         except ClientError as e:
@@ -262,49 +278,9 @@ class DynamoDBClient:
             self._ensure_table_exists()
             processed_emails = []
             
-            # Try to use the index first
-            try:
-                response = self.table.query(
-                    IndexName='account-email-index',
-                    KeyConditionExpression='account_email = :account',
-                    ExpressionAttributeValues={
-                        ':account': account_email
-                    }
-                )
-                
-                processed_emails.extend(response['Items'])
-                
-                while 'LastEvaluatedKey' in response:
-                    response = self.table.query(
-                        IndexName='account-email-index',
-                        KeyConditionExpression='account_email = :account',
-                        ExpressionAttributeValues={
-                            ':account': account_email
-                        },
-                        ExclusiveStartKey=response['LastEvaluatedKey']
-                    )
-                    processed_emails.extend(response['Items'])
-                
-                return processed_emails
-                
-            except ClientError as index_error:
-                # If index doesn't exist, fall back to scan
-                if 'ValidationException' in str(index_error) and 'index' in str(index_error).lower():
-                    print(f"Index 'account-email-index' not found, falling back to scan for account {account_email}")
-                    return self._scan_by_account(account_email)
-                else:
-                    raise index_error
-            
-        except ClientError as e:
-            print(f"Error querying DynamoDB table for account {account_email}: {e}")
-            return []
-    
-    def _scan_by_account(self, account_email: str) -> List[Dict[str, Any]]:
-        """Fallback method to scan table by account when index is not available"""
-        try:
-            processed_emails = []
-            response = self.table.scan(
-                FilterExpression='account_email = :account',
+            # Use efficient query on partition key
+            response = self.table.query(
+                KeyConditionExpression='account_email = :account',
                 ExpressionAttributeValues={
                     ':account': account_email
                 }
@@ -313,8 +289,8 @@ class DynamoDBClient:
             processed_emails.extend(response['Items'])
             
             while 'LastEvaluatedKey' in response:
-                response = self.table.scan(
-                    FilterExpression='account_email = :account',
+                response = self.table.query(
+                    KeyConditionExpression='account_email = :account',
                     ExpressionAttributeValues={
                         ':account': account_email
                     },
@@ -325,125 +301,23 @@ class DynamoDBClient:
             return processed_emails
             
         except ClientError as e:
-            print(f"Error scanning DynamoDB table for account {account_email}: {e}")
+            print(f"Error querying DynamoDB table for account {account_email}: {e}")
             return []
     
-    def get_account_processing_stats(self) -> Dict[str, Dict[str, int]]:
-        """Get processing statistics by account"""
-        try:
-            self._ensure_table_exists()
-            stats = {}
-            response = self.table.scan()
-            
-            for item in response['Items']:
-                account = item.get('account_email', 'unknown')
-                status = item.get('status', 'processed')
-                
-                if account not in stats:
-                    stats[account] = {'processed': 0, 'failed': 0, 'total': 0}
-                
-                stats[account][status] = stats[account].get(status, 0) + 1
-                stats[account]['total'] += 1
-            
-            while 'LastEvaluatedKey' in response:
-                response = self.table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
-                for item in response['Items']:
-                        
-                    account = item.get('account_email', 'unknown')
-                    status = item.get('status', 'processed')
-                    
-                    if account not in stats:
-                        stats[account] = {'processed': 0, 'failed': 0, 'total': 0}
-                    
-                    stats[account][status] = stats[account].get(status, 0) + 1
-                    stats[account]['total'] += 1
-            
-            return stats
-        except ClientError as e:
-            print(f"Error getting account processing stats: {e}")
-            return {}
-    
-    def delete_email_record(self, email_id: str) -> bool:
+    def delete_email_record(self, email_id: str, account_email: str, folder_path: str) -> bool:
         """Delete an email ID from DynamoDB"""
         try:
             self._ensure_table_exists()
-            self.table.delete_item(Key={'email_id': str(email_id)})
+            folder_email_key = self._create_folder_email_key(folder_path, email_id)
+            self.table.delete_item(Key={
+                'account_email': account_email,
+                'folder_email_key': folder_email_key
+            })
             return True
         except ClientError as e:
             error_msg = handle_error_securely(e, f"deleting email {sanitize_for_logging(str(email_id))} from DynamoDB")
             logger.error(error_msg)
             return False
-    
-    def record_sync_execution(self, sync_mode: str, account_email: str, 
-                            emails_processed: int, emails_attempted: int) -> bool:
-        """Record sync execution details"""
-        try:
-            self._ensure_table_exists()
-            current_time = datetime.now(timezone.utc).isoformat()
-            
-            # Create a unique sync record ID
-            sync_record_id = f"sync_{account_email}_{current_time}"
-            
-            self.table.put_item(
-                Item={
-                    'email_id': sync_record_id,
-                    'record_type': 'sync_execution',
-                    'account_email': account_email,
-                    'sync_mode': sync_mode,
-                    'emails_processed': emails_processed,
-                    'emails_attempted': emails_attempted,
-                    'execution_time': current_time,
-                    'processed_at': current_time
-                }
-            )
-            
-            print(f"  DynamoDB: Recorded sync execution for {account_email} ({sync_mode} mode)")
-            return True
-            
-        except ClientError as e:
-            print(f"Error recording sync execution: {e}")
-            return False
-    
-    def get_last_full_sync(self, account_email: str) -> Optional[str]:
-        """Get the timestamp of the last full sync for an account"""
-        try:
-            self._ensure_table_exists()
-            
-            # Scan for sync execution records for this account
-            response = self.table.scan(
-                FilterExpression='account_email = :account AND record_type = :type AND sync_mode = :mode',
-                ExpressionAttributeValues={
-                    ':account': account_email,
-                    ':type': 'sync_execution',
-                    ':mode': 'full'
-                }
-            )
-            
-            sync_records = response.get('Items', [])
-            
-            # Continue scanning if there are more items
-            while 'LastEvaluatedKey' in response:
-                response = self.table.scan(
-                    FilterExpression='account_email = :account AND record_type = :type AND sync_mode = :mode',
-                    ExpressionAttributeValues={
-                        ':account': account_email,
-                        ':type': 'sync_execution',
-                        ':mode': 'full'
-                    },
-                    ExclusiveStartKey=response['LastEvaluatedKey']
-                )
-                sync_records.extend(response.get('Items', []))
-            
-            if sync_records:
-                # Sort by execution time and get the most recent
-                sync_records.sort(key=lambda x: x.get('execution_time', ''), reverse=True)
-                return sync_records[0].get('execution_time')
-            
-            return None
-            
-        except ClientError as e:
-            print(f"Error getting last full sync for {account_email}: {e}")
-            return None
     
     def clear_processed_emails_for_account(self, account_email: str) -> bool:
         """Clear all processed email records for an account (for full sync)"""
@@ -467,7 +341,13 @@ class DynamoDBClient:
                 
                 with self.table.batch_writer() as batch_writer:
                     for email in batch:
-                        batch_writer.delete_item(Key={'email_id': email['email_id']})
+                        account_email_key = email.get('account_email')
+                        folder_email_key = email.get('folder_email_key')
+                        if account_email_key and folder_email_key:
+                            batch_writer.delete_item(Key={
+                                'account_email': account_email_key,
+                                'folder_email_key': folder_email_key
+                            })
             
             print(f"Cleared processed email records for {account_email}")
             return True
@@ -477,20 +357,23 @@ class DynamoDBClient:
             return False
     
     def check_table_structure(self) -> bool:
-        """Check if table has the required index structure"""
+        """Check if table has the required structure"""
         try:
             self._ensure_table_exists()
             table_description = self.table.meta.client.describe_table(TableName=self.config.table_name)
             
-            # Check if account-email-index exists
-            gsi_list = table_description.get('Table', {}).get('GlobalSecondaryIndexes', [])
-            has_account_index = any(gsi.get('IndexName') == 'account-email-index' for gsi in gsi_list)
+            # Check primary key structure
+            key_schema = table_description.get('Table', {}).get('KeySchema', [])
+            has_partition_key = any(key.get('AttributeName') == 'account_email' and key.get('KeyType') == 'HASH' for key in key_schema)
+            has_sort_key = any(key.get('AttributeName') == 'folder_email_key' and key.get('KeyType') == 'RANGE' for key in key_schema)
             
-            if has_account_index:
-                print(f"✅ Table {self.config.table_name} has required account-email-index")
+            if has_partition_key and has_sort_key:
+                print(f"✅ Table {self.config.table_name} has required partition key (account_email) and sort key (folder_email_key)")
                 return True
             else:
-                print(f"⚠️  Table {self.config.table_name} is missing account-email-index")
+                print(f"⚠️  Table {self.config.table_name} is missing required key structure")
+                print(f"    Has partition key (account_email): {has_partition_key}")
+                print(f"    Has sort key (folder_email_key): {has_sort_key}")
                 return False
                 
         except ClientError as e:
@@ -509,14 +392,6 @@ class DynamoDBClient:
             if table_status != 'ACTIVE':
                 print(f"⚠️  Table {self.config.table_name} is not active (status: {table_status})")
                 return False
-            
-            # Check GSI status
-            gsi_list = table_description.get('Table', {}).get('GlobalSecondaryIndexes', [])
-            for gsi in gsi_list:
-                gsi_status = gsi.get('IndexStatus', 'UNKNOWN')
-                if gsi_status != 'ACTIVE':
-                    print(f"⚠️  GSI {gsi.get('IndexName')} is not active (status: {gsi_status})")
-                    return False
             
             print(f"✅ Table {self.config.table_name} is ready for use")
             return True

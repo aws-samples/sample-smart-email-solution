@@ -1,0 +1,47 @@
+name: exchange-sync
+type: Backend Service
+
+# Container configuration
+image:
+  build: './Dockerfile'
+
+# Resource allocation
+platform: linux/x86_64
+cpu: 1024      # 1 vCPU
+memory: 2048   # 2 GB RAM
+
+# Environment variables
+variables:
+  ENVIRONMENT: ${COPILOT_ENVIRONMENT_NAME}
+  PARAMETER_STORE_PREFIX: /exchange-connector/${COPILOT_ENVIRONMENT_NAME}
+  DYNAMODB_TABLE_NAME: ${COPILOT_APPLICATION_NAME}-${COPILOT_ENVIRONMENT_NAME}-processed-emails
+  SYNC_MODE: delta
+  ENABLE_THREADING: "true"
+  MAX_WORKER_THREADS: "4"
+  THREAD_BATCH_SIZE: "10"  # Reduced to comply with Q Business limits
+  DOCUMENT_BATCH_SIZE: "10"
+  AUTO_RESOLVE_SYNC_CONFLICTS: "true"
+  # Container splitting configuration (defaults for single container mode)
+  CONTAINER_INDEX: "0"
+  TOTAL_CONTAINERS: "1"
+
+# Secrets from Parameter Store - using existing paths for backwards compatibility
+secrets:
+  EXCHANGE_CLIENT_ID: /exchange-connector/${COPILOT_ENVIRONMENT_NAME}/exchange-client-id
+  EXCHANGE_CLIENT_SECRET: /exchange-connector/${COPILOT_ENVIRONMENT_NAME}/exchange-client-secret
+  EXCHANGE_TENANT_ID: /exchange-connector/${COPILOT_ENVIRONMENT_NAME}/exchange-tenant-id
+  QBUSINESS_APPLICATION_ID: /exchange-connector/${COPILOT_ENVIRONMENT_NAME}/qbusiness-application-id
+  QBUSINESS_INDEX_ID: /exchange-connector/${COPILOT_ENVIRONMENT_NAME}/qbusiness-index-id
+  QBUSINESS_DATASOURCE_ID: /exchange-connector/${COPILOT_ENVIRONMENT_NAME}/qbusiness-datasource-id
+
+# Health check configuration
+http:
+  healthcheck: '/health'
+
+# Service configuration
+count: 1  # Single instance per environment
+
+# Network configuration
+network:
+  vpc:
+    enable_logs: true

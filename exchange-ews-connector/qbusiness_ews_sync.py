@@ -8,102 +8,114 @@ import os
 import sys
 import json
 import logging
+import time
+import threading
+import signal
 from datetime import datetime, timezone
 
-# Load environment variables from .env file for local development only
-if not os.environ.get('AWS_LAMBDA_FUNCTION_NAME'):
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
+# Load environment variables from .env file for local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Import modular components
 from modules.config import Config
 from modules.email_processor import EmailProcessor
 from modules.qbusiness_client import QBusinessClient
 from modules.security_utils import sanitize_for_logging
+from health_server import start_health_server, stop_health_server
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-def run_exchange_connector(sync_mode='delta', is_lambda=False, event=None, context=None):
+# Suppress verbose exchangelib logging for naive datetime warnings
+exchangelib_fields_logger = logging.getLogger('exchangelib.fields')
+exchangelib_fields_logger.setLevel(logging.WARNING)  # Only show WARNING and above, suppress INFO
+
+def get_assigned_accounts(all_accounts, container_index=None, total_containers=None):
     """
-    Shared logic for running the Exchange connector.
-    Used by both main() and lambda_handler() functions.
+    Split email accounts across multiple containers for parallel processing.
+    
+    Args:
+        all_accounts: List of all email accounts to process
+        container_index: Current container index (0-based)
+        total_containers: Total number of containers
+    
+    Returns:
+        List of accounts assigned to this container
+    """
+    if container_index is None or total_containers is None:
+        # No splitting - return all accounts
+        return all_accounts
+    
+    if total_containers <= 1:
+        return all_accounts
+    
+    if container_index >= total_containers:
+        logger.warning(f"Container index {container_index} >= total containers {total_containers}")
+        return []
+    
+    # Round-robin assignment of accounts to containers
+    assigned_accounts = []
+    for i, account in enumerate(all_accounts):
+        if i % total_containers == container_index:
+            assigned_accounts.append(account)
+    
+    logger.info(f"Container {container_index + 1}/{total_containers} assigned {len(assigned_accounts)} accounts: {assigned_accounts}")
+    return assigned_accounts
+
+def run_exchange_connector(sync_mode='delta', container_index=None, total_containers=None):
+    """
+    Main logic for running the Exchange connector.
     
     Args:
         sync_mode: 'delta' or 'full' sync mode
-        is_lambda: True if running in Lambda, False for local execution
-        event: Lambda event (only used in Lambda)
-        context: Lambda context (only used in Lambda)
+        container_index: Current container index for account splitting (0-based)
+        total_containers: Total number of containers for account splitting
     
     Returns:
-        For Lambda: dict with statusCode and body
-        For local: int exit code (0 for success, non-zero for failure)
+        int exit code (0 for success, non-zero for failure)
     """
     # Input validation
     if sync_mode not in ['delta', 'full']:
         error_msg = f"Invalid sync_mode: {sync_mode}. Must be 'delta' or 'full'"
         logger.error(error_msg)
-        if is_lambda:
-            return {
-                'statusCode': 400,
-                'body': json.dumps({
-                    'error': error_msg,
-                    'timestamp': datetime.now(timezone.utc).isoformat()
-                })
-            }
-        else:
-            return 1
-    
-    # Validate Lambda context if provided
-    if is_lambda and context:
-        remaining_time = getattr(context, 'get_remaining_time_in_millis', lambda: 900000)()
-        if remaining_time < 60000:  # Less than 1 minute remaining
-            error_msg = "Insufficient time remaining for execution"
-            logger.error(error_msg)
-            return {
-                'statusCode': 408,
-                'body': json.dumps({
-                    'error': error_msg,
-                    'timestamp': datetime.now(timezone.utc).isoformat()
-                })
-            }
+        return 1
     
     execution_start_time = datetime.now(timezone.utc)
     
     # Initialize configuration and components
     config = Config()
+    
+    # Apply account splitting if specified
+    if container_index is not None and total_containers is not None:
+        original_accounts = config.primary_smtp_addresses.copy()
+        assigned_accounts = get_assigned_accounts(original_accounts, container_index, total_containers)
+        config.primary_smtp_addresses = assigned_accounts
+        
+        if not assigned_accounts:
+            print(f"ℹ️  Container {container_index + 1}/{total_containers} has no accounts assigned - exiting gracefully")
+            return 0
+        
+        print(f"🔀 Account splitting enabled: Container {container_index + 1}/{total_containers}")
+        print(f"📧 Processing {len(assigned_accounts)} of {len(original_accounts)} total accounts")
+        print(f"📋 Assigned accounts: {', '.join(assigned_accounts)}")
+        print()
+    
     email_processor = EmailProcessor(config)
     qbusiness_client = QBusinessClient(config)
-    
-    # Set execution start time for timeout tracking (Lambda only)
-    if is_lambda:
-        email_processor.execution_start_time = execution_start_time
     
     # Verify DynamoDB table is ready
     if not email_processor.dynamodb_client.verify_table_ready():
         error_msg = f'DynamoDB table {config.table_name} is not ready for use'
-        if is_lambda:
-            return {
-                'statusCode': 500,
-                'body': json.dumps({
-                    'error': error_msg,
-                    'timestamp': datetime.now(timezone.utc).isoformat()
-                })
-            }
-        else:
-            print(f"❌ {error_msg}")
-            return 1
-    
-    if is_lambda:
-        print(f"Lambda execution started at: {execution_start_time.isoformat()}")
-        print(f"Event: {sanitize_for_logging(json.dumps(event, default=str))}")
+        print(f"❌ {error_msg}")
+        return 1
     
     try:
-        # Handle force-stop for local execution
-        if not is_lambda and len(sys.argv) > 1 and '--force-stop' in sys.argv:
+        # Handle force-stop for execution
+        if len(sys.argv) > 1 and '--force-stop' in sys.argv:
             print("🛑 Force stopping all running sync jobs...")
             if qbusiness_client.force_stop_all_sync_jobs():
                 print("✅ All sync jobs stopped successfully")
@@ -114,289 +126,320 @@ def run_exchange_connector(sync_mode='delta', is_lambda=False, event=None, conte
         # Check for existing running sync jobs
         if qbusiness_client.has_running_sync_jobs():
             if config.auto_resolve_sync_conflicts:
-                if not is_lambda:
-                    print("⚠️  Detected existing running sync jobs. Auto-resolve is enabled - will stop existing jobs when sync job is needed.")
+                print("⚠️  Detected existing running sync jobs. Auto-resolve is enabled - will stop existing jobs when sync job is needed.")
             else:
                 error_msg = "Cannot start new sync job while another is running. Set AUTO_RESOLVE_SYNC_CONFLICTS=true to automatically stop existing jobs."
-                if is_lambda:
-                    print(f"⚠️  {error_msg}")
-                else:
-                    print("⚠️  Detected existing running sync jobs. Auto-resolve is disabled.")
-                    print(f"❌ {error_msg}")
-                    print("💡 Alternatively, use --force-stop flag to stop all running jobs before starting.")
-                    return 1 if not is_lambda else {
-                        'statusCode': 500,
-                        'body': json.dumps({
-                            'error': error_msg,
-                            'timestamp': datetime.now(timezone.utc).isoformat()
-                        })
-                    }
+                print("⚠️  Detected existing running sync jobs. Auto-resolve is disabled.")
+                print(f"❌ {error_msg}")
+                print("💡 Alternatively, use --force-stop flag to stop all running jobs before starting.")
+                return 1
         
         # Start sync job once at the beginning if we expect to process any data
-        sync_job_id = None
-        if not is_lambda:
-            print("🚀 Starting Q Business sync job for the full sync process...")
+        print("🚀 Starting Q Business sync job for the full sync process...")
         sync_job_id = qbusiness_client.start_sync_job()
         if not sync_job_id:
             error_msg = "Failed to start Q Business sync job"
             print(f"❌ {error_msg}")
-            if is_lambda:
-                return {
-                    'statusCode': 500,
-                    'body': json.dumps({
-                        'error': error_msg,
-                        'timestamp': datetime.now(timezone.utc).isoformat()
-                    })
-                }
-            else:
-                return 1
+            return 1
         
         # Process all configured Exchange accounts
-        if is_lambda and email_processor.is_timeout_approaching():
-            print("Lambda timeout approaching. Skipping account processing...")
-            success = True
-            changes = {'processed_count': 0, 'failed_count': 0}
-        else:
-            if not is_lambda:
-                print(f"\n📧 Processing Exchange accounts ({sync_mode} sync)...")
-            success, changes = email_processor.process_all_accounts(sync_mode, sync_job_id)
-            if not success:
-                error_msg = "Failed to process any Exchange accounts"
-                print(f"❌ {error_msg}")
-                if is_lambda:
-                    return {
-                        'statusCode': 500,
-                        'body': json.dumps({
-                            'error': error_msg,
-                            'timestamp': datetime.now(timezone.utc).isoformat()
-                        })
-                    }
-                else:
-                    return 1
+        print(f"\n📧 Processing Exchange accounts ({sync_mode} sync)...")
+        success, changes = email_processor.process_all_accounts(sync_mode, sync_job_id)
+        if not success:
+            error_msg = "Failed to process any Exchange accounts"
+            print(f"❌ {error_msg}")
+            return 1
         
-        # Clean up orphaned items
-        if is_lambda and email_processor.is_timeout_approaching():
-            print("Lambda timeout approaching. Skipping cleanup of orphaned items...")
-            changes['orphaned_ids'] = []
-        else:
-            if not is_lambda:
-                print(f"\n🔍 Comprehensive orphaned document detection...")
-            orphaned_ids = email_processor.find_orphaned_items_with_sync(sync_mode, sync_job_id)
-            changes['orphaned_ids'] = orphaned_ids
+        # Orphaned items are now cleaned up during folder processing
+        print(f"\n✅ Orphaned items were cleaned up during folder processing")
         
         # Final processing summary
-        if not is_lambda:
-            print(f"\n✅ All processing completed successfully with sync job: {qbusiness_client.current_sync_job_id}")
-            print(f"📊 Final Summary: {changes.get('processed_count', 0)} documents processed, {changes.get('failed_count', 0)} failed, {len(changes.get('orphaned_ids', []))} orphaned items deleted")
+        print(f"\n✅ All processing completed successfully with sync job: {qbusiness_client.current_sync_job_id}")
+        print(f"📊 Final Summary: {changes.get('processed_count', 0)} documents processed, {changes.get('failed_count', 0)} failed, {changes.get('orphaned_count', 0)} orphaned items deleted")
         
         # Stop sync job at the end
-        if not is_lambda:
-            print("\n🛑 Stopping Q Business sync job...")
+        print("\n🛑 Stopping Q Business sync job...")
         qbusiness_client.stop_sync_job()
         
         # Print final summary
         print(f"Total emails attempted: {email_processor.emails_attempted_count}")
         print(f"Total emails successfully processed: {email_processor.emails_processed_count}")
         
-        if is_lambda:
-            # Lambda response
-            final_status = qbusiness_client.get_sync_job_status()
-            execution_time = (datetime.now(timezone.utc) - execution_start_time).total_seconds()
-            timeout_reached = email_processor.is_timeout_approaching()
-            
-            response = {
-                'statusCode': 200,
-                'body': json.dumps({
-                    'message': 'Exchange connector execution completed successfully',
-                    'attempted_emails': email_processor.emails_attempted_count,
-                    'processed_emails': email_processor.emails_processed_count,
-                    'sync_job_id': qbusiness_client.current_sync_job_id,
-                    'sync_job_status': final_status,
-                    'sync_job_started': qbusiness_client.sync_job_started,
-                    'application_id': config.application_id,
-                    'index_id': config.index_id,
-                    'data_source_id': config.data_source_id,
-                    'execution_time_seconds': round(execution_time, 2),
-                    'timeout_reached': timeout_reached,
-                    'timestamp': datetime.now(timezone.utc).isoformat()
-                })
-            }
-            
-            print(f"Lambda execution completed successfully: {response}")
-            return response
-        else:
-            # Local execution summary
-            print("\n" + "=" * 80)
-            print(f"EXECUTION SUMMARY - {sync_mode.upper()} SYNC")
-            print("=" * 80)
-            print(f"✅ Sync Mode: {sync_mode.upper()}")
-            print(f"✅ Total emails attempted: {email_processor.emails_attempted_count}")
-            print(f"✅ Total emails successfully processed: {email_processor.emails_processed_count}")
-            print(f"✅ Documents processed: {changes.get('processed_count', 0)}")
-            print(f"✅ Documents failed: {changes.get('failed_count', 0)}")
-            print(f"✅ Orphaned items cleaned: {len(changes.get('orphaned_ids', []))}")
-            print(f"✅ Completed at: {datetime.now(timezone.utc).isoformat()}")
-            
-            # Additional local-only summaries
-            if sync_mode == 'delta' and len(changes.get('orphaned_ids', [])) > 0:
-                print(f"\n🧹 ORPHANED DOCUMENT CLEANUP SUMMARY:")
-                print(f"  📧 Detected {len(changes.get('orphaned_ids', []))} emails that no longer exist in Exchange")
-                print(f"  🗑️  These documents were removed from both Q Business and DynamoDB tracking")
-                print(f"  ✅ This ensures Q Business index stays synchronized with current Exchange content")
-            elif sync_mode == 'full':
-                print(f"\n🔄 FULL SYNC CLEANUP SUMMARY:")
-                print(f"  🧹 DynamoDB tracking table was cleared before reprocessing")
-                print(f"  📧 All current emails were reprocessed")
-                print(f"  ✅ This ensures complete synchronization and removes any orphaned documents")
-            
-            # Account-specific statistics
-            print("\n📊 ACCOUNT PROCESSING STATISTICS")
-            print("-" * 50)
-            account_stats = email_processor.dynamodb_client.get_account_processing_stats()
-            for account, stats in account_stats.items():
-                if account != 'unknown':
-                    processed = stats.get('processed', 0)
-                    failed = stats.get('failed', 0)
-                    total = stats.get('total', 0)
-                    print(f"📧 {account}:")
-                    print(f"   ✅ Processed: {processed}")
-                    if failed > 0:
-                        print(f"   ❌ Failed: {failed}")
-                    print(f"   📊 Total: {total}")
-            
-            total_processed = changes.get('processed_count', 0)
-            total_orphaned = len(changes.get('orphaned_ids', []))
-            total_changes = total_processed + total_orphaned
-            
-            if total_changes > 0:
-                if sync_mode == 'full':
-                    print(f"\n🎉 Full sync completed! Processed {total_processed} documents and cleaned {total_orphaned} orphaned items!")
-                else:
-                    print(f"\n🎉 Delta sync completed! Processed {total_processed} documents and cleaned {total_orphaned} orphaned items!")
+        # Execution summary
+        print("\n" + "=" * 80)
+        print(f"EXECUTION SUMMARY - {sync_mode.upper()} SYNC")
+        print("=" * 80)
+        print(f"✅ Sync Mode: {sync_mode.upper()}")
+        print(f"✅ Total emails attempted: {email_processor.emails_attempted_count}")
+        print(f"✅ Total emails successfully processed: {email_processor.emails_processed_count}")
+        print(f"✅ Documents processed: {changes.get('processed_count', 0)}")
+        print(f"✅ Documents failed: {changes.get('failed_count', 0)}")
+        print(f"✅ Orphaned items cleaned: {changes.get('orphaned_count', 0)}")
+        print(f"✅ Completed at: {datetime.now(timezone.utc).isoformat()}")
+        
+        # Additional summaries
+        if sync_mode == 'delta' and changes.get('orphaned_count', 0) > 0:
+            print(f"\n🧹 ORPHANED DOCUMENT CLEANUP SUMMARY:")
+            print(f"  📧 Detected {changes.get('orphaned_count', 0)} emails that no longer exist in Exchange")
+            print(f"  🗑️  These documents were removed from both Q Business and DynamoDB tracking")
+            print(f"  ✅ This ensures Q Business index stays synchronized with current Exchange content")
+        elif sync_mode == 'full':
+            print(f"\n🔄 FULL SYNC CLEANUP SUMMARY:")
+            print(f"  🧹 DynamoDB tracking table was cleared before reprocessing")
+            print(f"  📧 All current emails were reprocessed")
+            print(f"  ✅ This ensures complete synchronization and removes any orphaned documents")
+        
+        # Account-specific statistics
+        print("\n📊 ACCOUNT PROCESSING STATISTICS")
+        print("-" * 50)
+        account_stats = email_processor.get_account_processing_stats()
+        for account, stats in account_stats.items():
+            if account != 'unknown':
+                processed = stats.get('processed', 0)
+                failed = stats.get('failed', 0)
+                total = stats.get('total', 0)
+                print(f"📧 {account}:")
+                print(f"   ✅ Processed: {processed}")
+                if failed > 0:
+                    print(f"   ❌ Failed: {failed}")
+                print(f"   📊 Total: {total}")
+        
+        total_processed = changes.get('processed_count', 0)
+        total_orphaned = changes.get('orphaned_count', 0)
+        total_changes = total_processed + total_orphaned
+        
+        if total_changes > 0:
+            if sync_mode == 'full':
+                print(f"\n🎉 Full sync completed! Processed {total_processed} documents and cleaned {total_orphaned} orphaned items!")
             else:
-                if sync_mode == 'full':
-                    print(f"\nℹ️  Full sync completed - no emails found to process")
-                else:
-                    print(f"\nℹ️  Delta sync completed - no changes detected, all emails already indexed and up to date")
-            
-            return 0
+                print(f"\n🎉 Delta sync completed! Processed {total_processed} documents and cleaned {total_orphaned} orphaned items!")
+        else:
+            if sync_mode == 'full':
+                print(f"\nℹ️  Full sync completed - no emails found to process")
+            else:
+                print(f"\nℹ️  Delta sync completed - no changes detected, all emails already indexed and up to date")
+        
+        return 0
         
     except KeyboardInterrupt:
-        if not is_lambda:
-            print("\n\n⚠️  Execution interrupted by user")
+        print("\n\n⚠️  Execution interrupted by user")
         try:
             if qbusiness_client.sync_job_started:
-                if not is_lambda:
-                    print("🛑 Attempting to stop any active sync job...")
+                print("🛑 Attempting to stop any active sync job...")
                 qbusiness_client.stop_sync_job()
         except:
             pass
-        
-        if is_lambda:
-            return {
-                'statusCode': 500,
-                'body': json.dumps({
-                    'error': 'Execution interrupted',
-                    'timestamp': datetime.now(timezone.utc).isoformat()
-                })
-            }
-        else:
-            return 130
+        return 130
         
     except Exception as e:
         error_message = f"Execution failed: {str(e)}"
         print(f"\n❌ {error_message}")
         
-        if not is_lambda:
-            import traceback
-            traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         
         # Try to stop sync job in case of error
         try:
             if qbusiness_client.sync_job_started:
-                if not is_lambda:
-                    print("\n🛑 Stopping sync job due to error...")
+                print("\n🛑 Stopping sync job due to error...")
                 qbusiness_client.stop_sync_job()
         except:
             pass
         
-        if is_lambda:
-            return {
-                'statusCode': 500,
-                'body': json.dumps({
-                    'error': error_message,
-                    'timestamp': datetime.now(timezone.utc).isoformat()
-                })
-            }
-        else:
+        return 1
+
+class SyncScheduler:
+    """
+    Scheduler that runs sync operations every 30 minutes in a continuously running container.
+    """
+    
+    def __init__(self):
+        self.running = True
+        self.sync_in_progress = False
+        self.sync_thread = None
+        self.health_server = None
+        
+        # Get configuration
+        self.container_index = None
+        self.total_containers = None
+        self.sync_mode = None
+        
+        # Setup signal handlers for graceful shutdown
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully."""
+        print(f"\n🛑 Received signal {signum}, shutting down gracefully...")
+        self.running = False
+        
+        # Stop health server
+        stop_health_server()
+        
+        # Wait for current sync to complete if running
+        if self.sync_in_progress and self.sync_thread:
+            print("⏳ Waiting for current sync to complete...")
+            self.sync_thread.join(timeout=30)  # Wait up to 30 seconds
+    
+    def _parse_arguments(self):
+        """Parse command line arguments."""
+        if len(sys.argv) > 1:
+            for arg in sys.argv[1:]:
+                arg_lower = arg.lower()
+                if arg_lower in ['full_sync', 'full']:
+                    self.sync_mode = 'full'
+                elif arg_lower in ['delta_sync', 'delta']:
+                    self.sync_mode = 'delta'
+                elif arg_lower == '--once':
+                    # Run once and exit (for testing)
+                    return 'once'
+                elif arg_lower not in ['--force-stop', '-h', '--help']:
+                    print(f"❌ Invalid argument: {arg}")
+                    print("Valid options: full_sync, delta_sync, full, delta, --once")
+                    return 'error'
+        return 'continuous'
+    
+    def _get_container_config(self):
+        """Get container splitting configuration."""
+        if os.environ.get('CONTAINER_INDEX') and os.environ.get('TOTAL_CONTAINERS'):
+            try:
+                self.container_index = int(os.environ.get('CONTAINER_INDEX'))
+                self.total_containers = int(os.environ.get('TOTAL_CONTAINERS'))
+                
+                if self.container_index < 0 or self.total_containers <= 0:
+                    print("❌ Invalid container parameters: CONTAINER_INDEX must be >= 0, TOTAL_CONTAINERS must be > 0")
+                    return False
+                    
+                if self.container_index >= self.total_containers:
+                    print(f"❌ Invalid container parameters: CONTAINER_INDEX ({self.container_index}) must be < TOTAL_CONTAINERS ({self.total_containers})")
+                    return False
+                    
+            except ValueError:
+                print("❌ Invalid container parameters: CONTAINER_INDEX and TOTAL_CONTAINERS must be integers")
+                return False
+        
+        return True
+    
+    def _run_sync(self):
+        """Run a single sync operation in a separate thread."""
+        if self.sync_in_progress:
+            print("⚠️  Sync already in progress, skipping this cycle")
+            return
+        
+        self.sync_in_progress = True
+        
+        try:
+            execution_start_time = datetime.now(timezone.utc)
+            
+            # Initialize configuration
+            config = Config()
+            
+            # Override sync mode if provided via command line
+            if self.sync_mode:
+                config.sync_mode = self.sync_mode
+            
+            sync_mode = config.sync_mode
+            
+            print("\n" + "=" * 80)
+            print(f"Exchange Online Archive Connector - {sync_mode.upper()} SYNC")
+            print("=" * 80)
+            print(f"Started at: {execution_start_time.isoformat()}")
+            print(f"Sync Mode: {sync_mode.upper()}")
+            if self.container_index is not None:
+                print(f"Container: {self.container_index + 1}/{self.total_containers}")
+            print()
+            
+            # Run the sync
+            exit_code = run_exchange_connector(
+                sync_mode=sync_mode, 
+                container_index=self.container_index, 
+                total_containers=self.total_containers
+            )
+            
+            if exit_code == 0:
+                print("✅ Sync completed successfully")
+            else:
+                print(f"⚠️  Sync completed with warnings (exit code: {exit_code})")
+                
+        except Exception as e:
+            print(f"❌ Sync failed with error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.sync_in_progress = False
+    
+    def _sync_worker(self):
+        """Worker thread that runs the sync operation."""
+        self._run_sync()
+    
+    def run_continuous(self):
+        """Run the scheduler continuously with 30-minute intervals."""
+        print("🚀 Starting Exchange EWS Connector Scheduler")
+        print("⏰ Sync interval: 30 minutes")
+        print("🔄 Running continuously until stopped...")
+        print()
+        
+        # Start health server
+        self.health_server = start_health_server(port=8080)
+        
+        # Validate configuration
+        if not self._get_container_config():
             return 1
-
-
-def lambda_handler(event, context):
-    """
-    Lambda handler function that runs the Exchange Online Archive connector
-    """
-    return run_exchange_connector(sync_mode='delta', is_lambda=True, event=event, context=context)
-
+        
+        # Run first sync immediately
+        print("🏃 Running initial sync...")
+        self.sync_thread = threading.Thread(target=self._sync_worker)
+        self.sync_thread.start()
+        self.sync_thread.join()  # Wait for first sync to complete
+        
+        # Main scheduler loop
+        while self.running:
+            try:
+                # Wait 30 minutes (1800 seconds)
+                for i in range(1800):  # 30 minutes = 1800 seconds
+                    if not self.running:
+                        break
+                    time.sleep(1)
+                
+                if self.running:
+                    print(f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Starting scheduled sync...")
+                    self.sync_thread = threading.Thread(target=self._sync_worker)
+                    self.sync_thread.start()
+                    # Don't wait for completion, let it run in background
+                    
+            except KeyboardInterrupt:
+                print("\n🛑 Received keyboard interrupt, shutting down...")
+                break
+        
+        print("👋 Scheduler stopped")
+        return 0
+    
+    def run_once(self):
+        """Run sync once and exit (for testing)."""
+        print("🏃 Running sync once...")
+        
+        if not self._get_container_config():
+            return 1
+        
+        self._run_sync()
+        return 0
 
 def main():
     """
-    Main method for running the Exchange connector locally.
-    This allows for local testing and development without Lambda.
+    Main method for running the Exchange connector.
+    Supports both continuous scheduling and one-time execution.
     """
-    execution_start_time = datetime.now(timezone.utc)
+    scheduler = SyncScheduler()
     
-    # Initialize configuration (after environment variables are set)
-    config = Config()
+    # Parse arguments
+    mode = scheduler._parse_arguments()
     
-    # Initialize main processor
-    email_processor = EmailProcessor(config)
-    
-    # Initialize Q Business client for sync operations
-    qbusiness_client = QBusinessClient(config)
-    
-    # Get sync mode from config
-    sync_mode = config.sync_mode
-    
-    print("=" * 80)
-    print(f"Exchange Online Archive Connector - {sync_mode.upper()} SYNC (Modular)")
-    print("=" * 80)
-    print(f"Started at: {execution_start_time.isoformat()}")
-    print(f"Sync Mode: {sync_mode.upper()}")
-    print(f"SYNC_MODE env var: {os.environ.get('SYNC_MODE', 'not set')}")
-    print()
-    
-    # Check required environment variables
-    required_vars = config.get_required_vars()
-    
-    missing_vars = []
-    for var_name, var_value in required_vars.items():
-        if not var_value:
-            missing_vars.append(var_name)
-    
-    if missing_vars:
-        print("❌ Missing required environment variables:")
-        for var in missing_vars:
-            print(f"   - {var}")
-        print("\nPlease set these environment variables before running.")
+    if mode == 'error':
         return 1
-    
-    print("✅ Configuration validated")
-    print(f"Q Business Application: {config.application_id}")
-    if config.testing_email_limit is None:
-        print("Processing Limit: No limit (process all emails) - Local execution default")
+    elif mode == 'once':
+        return scheduler.run_once()
     else:
-        print(f"Processing Limit: {config.testing_email_limit} emails")
-    print(f"DynamoDB Table: {config.table_name}")
-    print(f"Email Addresses: {', '.join(config.primary_smtp_addresses)}")
-    print()
-    
-    print("🔍 Verifying DynamoDB table...")
-    print("📋 Q Business sync job will be started once at the beginning and reused throughout the process...")
-    print()
-    
-    # Use the shared logic
-    return run_exchange_connector(sync_mode=sync_mode, is_lambda=False)
+        return scheduler.run_continuous()
 
 
 if __name__ == "__main__":
@@ -411,7 +454,11 @@ if __name__ == "__main__":
         print("Exchange Online Archive Connector - Local Execution (Modular)")
         print("=" * 60)
         print()
-        print("Usage: python qbusiness_ews_sync_modular.py [--force-stop]")
+        print("Usage: python qbusiness_ews_sync_modular.py [sync_mode] [--force-stop]")
+        print()
+        print("Sync Modes:")
+        print("  full_sync, full             - Reprocess all emails, clearing existing records")
+        print("  delta_sync, delta           - Only process new/changed emails (default)")
         print()
         print("Options:")
         print("  --force-stop                - Force stop all running sync jobs before starting")
@@ -433,6 +480,9 @@ if __name__ == "__main__":
         print("  EMAIL_PROCESSING_LIMIT      - Max emails to process (default: 1 for Lambda, no limit for local)")
         print("  SYNC_MODE                   - Sync mode: 'delta' or 'full' (default: delta)")
         print("  AWS_DEFAULT_REGION          - AWS region (default: us-east-1)")
+        print("  ENABLE_THREADING            - Enable parallel processing: 'true' or 'false' (default: true)")
+        print("  MAX_WORKER_THREADS          - Maximum number of worker threads (default: 4)")
+        print("  THREAD_BATCH_SIZE           - Number of emails per thread batch (default: 50)")
         print()
         print("Sync Modes:")
         print("  delta                       - Only process new/changed emails (default)")

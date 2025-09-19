@@ -361,14 +361,36 @@ Content:
         return str(value).replace('\x00', '').strip()
     
     def format_datetime(self, dt_value) -> str:
-        """Format datetime for Q Business"""
+        """Format datetime for Q Business, ensuring timezone awareness"""
         if dt_value is None:
             return ""
         try:
             if hasattr(dt_value, 'isoformat'):
+                # Handle exchangelib datetime objects specially
+                if (hasattr(dt_value, '__class__') and 
+                    ('exchangelib' in str(dt_value.__class__) or 
+                     hasattr(dt_value, 'tzinfo') and dt_value.tzinfo and 'EWSTimeZone' in str(type(dt_value.tzinfo)))):
+                    # This is an exchangelib datetime object, use it directly
+                    return dt_value.isoformat()
+                
+                # Handle standard Python datetime objects
+                if hasattr(dt_value, 'tzinfo'):
+                    if dt_value.tzinfo is None:
+                        # Convert naive datetime to UTC with a warning
+                        print(f"Warning: Converting naive datetime {dt_value} to UTC")
+                        dt_value = dt_value.replace(tzinfo=timezone.utc)
+                    else:
+                        # For timezone-aware datetime, convert to UTC if it's not an EWS datetime
+                        try:
+                            dt_value = dt_value.astimezone(timezone.utc)
+                        except (TypeError, ValueError):
+                            # If conversion fails (e.g., EWSTimeZone), use as-is
+                            pass
+                
                 return dt_value.isoformat()
             return str(dt_value)
-        except:
+        except Exception as e:
+            print(f"Warning: Error formatting datetime {dt_value}: {e}")
             return ""
     
     def get_email_addresses_list(self, recipients) -> List[str]:

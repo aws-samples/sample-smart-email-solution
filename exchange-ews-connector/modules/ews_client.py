@@ -3,8 +3,28 @@ EWS Client Module
 Handles Exchange Web Services connections and operations
 """
 
+import logging
 from typing import Optional, Set
 from exchangelib import OAuth2Credentials, Configuration, Account, OAUTH2, IMPERSONATION, Identity
+import pytz
+
+# Set default timezone for exchangelib to avoid naive datetime warnings
+import exchangelib.util
+import exchangelib.fields
+
+# Configure exchangelib to use UTC timezone by default
+exchangelib.util.DEFAULT_TIMEZONE = pytz.UTC
+
+# Also set the default timezone for datetime fields
+try:
+    exchangelib.fields.DEFAULT_TIMEZONE = pytz.UTC
+except AttributeError:
+    # Fallback if the attribute doesn't exist in this version
+    pass
+
+# Suppress verbose exchangelib logging for naive datetime warnings
+exchangelib_fields_logger = logging.getLogger('exchangelib.fields')
+exchangelib_fields_logger.setLevel(logging.WARNING)  # Only show WARNING and above, suppress INFO
 
 class EWSClient:
     """
@@ -47,6 +67,7 @@ class EWSClient:
                 autodiscover=False,
                 config=config,
                 access_type=IMPERSONATION,  # Read-focused access pattern
+                default_timezone=pytz.UTC  # Explicitly set timezone to UTC to avoid naive datetime warnings
             )
             
             # Cache the account

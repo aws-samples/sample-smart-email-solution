@@ -126,7 +126,12 @@ class Config:
         'DOCUMENT_BATCH_SIZE': '10',  # Submit every 10 documents
         
         # Folder Processing Configuration
-        'PROCESS_MAIN_MAILBOX': 'false',  # Process main mailbox folders (default: false, only archive)
+        'PROCESS_MAIN_MAILBOX': 'true',  # Process main mailbox folders (default: false, only archive)
+        
+        # Threading Configuration
+        'ENABLE_THREADING': 'true',  # Enable parallel processing
+        'MAX_WORKER_THREADS': '4',   # Maximum number of worker threads
+        'THREAD_BATCH_SIZE': '50',   # Number of emails per thread batch
     }
     
     def __init__(self):
@@ -158,22 +163,14 @@ class Config:
         self.primary_smtp_addresses = parse_email_addresses(primary_smtp_addresses_raw)
         
         # Processing limits (0 means no limit - process all emails)
-        # For local development, default to no limit unless explicitly set
-        is_lambda_env = bool(os.environ.get('AWS_LAMBDA_FUNCTION_NAME'))
-        if is_lambda_env:
-            # In Lambda, use the configured limit (default 1 for safety)
-            limit_str = os.environ.get('EMAIL_PROCESSING_LIMIT', self.DEFAULT_VALUES['EMAIL_PROCESSING_LIMIT'])
-        else:
-            # For local execution, default to no limit (0) unless explicitly set
-            limit_str = os.environ.get('EMAIL_PROCESSING_LIMIT', '0')
+        limit_str = os.environ.get('EMAIL_PROCESSING_LIMIT', '0')
         
         self.testing_email_limit = int(limit_str) if limit_str != '0' else None
         
         # Sync mode configuration
         self.sync_mode = os.environ.get('SYNC_MODE', self.DEFAULT_VALUES['SYNC_MODE']).lower()
         
-        # Lambda timeout configuration
-        self.lambda_timeout_seconds = 14 * 60  # 14 minutes
+
         
         # HTML processing configuration
         self.html_processing_threshold = int(os.environ.get('HTML_PROCESSING_THRESHOLD', self.DEFAULT_VALUES['HTML_PROCESSING_THRESHOLD']))
@@ -189,6 +186,11 @@ class Config:
         
         # Folder processing configuration
         self.process_main_mailbox = os.environ.get('PROCESS_MAIN_MAILBOX', self.DEFAULT_VALUES['PROCESS_MAIN_MAILBOX']).lower() == 'true'
+        
+        # Threading configuration
+        self.enable_threading = os.environ.get('ENABLE_THREADING', self.DEFAULT_VALUES['ENABLE_THREADING']).lower() == 'true'
+        self.max_worker_threads = int(os.environ.get('MAX_WORKER_THREADS', self.DEFAULT_VALUES['MAX_WORKER_THREADS']))
+        self.thread_batch_size = int(os.environ.get('THREAD_BATCH_SIZE', self.DEFAULT_VALUES['THREAD_BATCH_SIZE']))
         
         # Validate configuration
         self._validate_config()
@@ -220,9 +222,7 @@ class Config:
         logger.info(f"  DynamoDB Table: {self.table_name}")
         logger.info(f"  AWS Region: {self.aws_region}")
         logger.info(f"  Parameter Store Prefix: {sanitize_for_logging(self.parameter_store_prefix)}")
-        is_lambda_env = bool(os.environ.get('AWS_LAMBDA_FUNCTION_NAME'))
-        limit_context = " (Lambda default)" if is_lambda_env and self.testing_email_limit else " (Local default)" if not is_lambda_env and not self.testing_email_limit else ""
-        logger.info(f"  Email Processing Limit: {self.testing_email_limit or 'No limit'}{limit_context}")
+        logger.info(f"  Email Processing Limit: {self.testing_email_limit or 'No limit'}")
         logger.info(f"  Sync Mode: {self.sync_mode}")
         logger.info(f"  Exchange Server: {self.exchange_server}")
         logger.info(f"  Email Addresses: {len(self.primary_smtp_addresses)} configured")
@@ -233,4 +233,3 @@ class Config:
         logger.info(f"  Max Sync Conflict Retries: {self.max_sync_conflict_retries}")
         logger.info(f"  Document Batch Size: {self.document_batch_size}")
         logger.info(f"  Process Main Mailbox: {self.process_main_mailbox}")
-        logger.info(f"  Lambda Timeout: {self.lambda_timeout_seconds // 60} minutes")
