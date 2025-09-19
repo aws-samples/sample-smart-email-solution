@@ -45,5 +45,5 @@ ENV PYTHONUNBUFFERED=1
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import sys; sys.exit(0)"
 
-# Default command - run continuously with internal 30-minute timer
+# Default command - run continuously with internal 24-hour timer
 CMD ["python", "qbusiness_ews_sync.py"]

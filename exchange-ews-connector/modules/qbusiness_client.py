@@ -6,6 +6,7 @@ Handles AWS Q Business operations for document indexing and sync job management
 import boto3
 import time
 import logging
+import threading
 from typing import Dict, Any, Optional, List
 from botocore.exceptions import ClientError
 from .security_utils import handle_error_securely
@@ -20,6 +21,17 @@ class QBusinessClient:
         self.client = boto3.client('qbusiness')
         self.current_sync_job_id = None
         self.sync_job_started = False
+        
+        # Sync job coordinator will be set by the main process
+        self.sync_coordinator = None
+        
+        # Heartbeat thread for keeping sync job alive
+        self._heartbeat_thread = None
+        self._heartbeat_stop_event = threading.Event()
+    
+    def set_sync_coordinator(self, sync_coordinator):
+        """Set the sync job coordinator for distributed sync job management"""
+        self.sync_coordinator = sync_coordinator
     
     def start_sync_job_if_needed(self) -> Optional[str]:
         """Start a Q Business data source sync job only if not already started"""
@@ -29,7 +41,12 @@ class QBusinessClient:
             return self.current_sync_job_id
         
         print("🚀 Starting Q Business sync job for first batch operation...")
-        return self.start_sync_job()
+        
+        # Use coordinator if available, otherwise fall back to direct start
+        if self.sync_coordinator:
+            return self.sync_coordinator.start_or_join_sync_job()
+        else:
+            return self.start_sync_job()
     
     def start_sync_job(self) -> Optional[str]:
         """Start a Q Business data source sync job"""
@@ -57,6 +74,10 @@ class QBusinessClient:
             if self.current_sync_job_id:
                 self.sync_job_started = True
                 print(f"✅ Sync job started successfully with ID: {self.current_sync_job_id}")
+                
+                # Start heartbeat thread to keep sync job alive
+                self._start_heartbeat_thread()
+                
                 return self.current_sync_job_id
             else:
                 print("⚠️  Warning: Sync job started but no execution ID returned")
@@ -244,32 +265,108 @@ class QBusinessClient:
         print("🛑 Force stopping all running sync jobs...")
         return self._stop_existing_sync_jobs()
     
+    def _start_heartbeat_thread(self):
+        """Start heartbeat thread to keep sync job coordinator updated"""
+        if self.sync_coordinator and not self._heartbeat_thread:
+            self._heartbeat_stop_event.clear()
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_worker, daemon=True)
+            self._heartbeat_thread.start()
+            logger.info("Started sync job heartbeat thread")
+    
+    def _stop_heartbeat_thread(self):
+        """Stop heartbeat thread"""
+        if self._heartbeat_thread:
+            logger.info("Stopping heartbeat thread...")
+            self._heartbeat_stop_event.set()
+            
+            # Wait for thread to finish
+            self._heartbeat_thread.join(timeout=10)
+            
+            if self._heartbeat_thread.is_alive():
+                logger.warning("Heartbeat thread did not stop within timeout")
+            else:
+                logger.info("Heartbeat thread stopped successfully")
+                
+            self._heartbeat_thread = None
+    
+    def _heartbeat_worker(self):
+        """Worker thread that sends periodic heartbeats to sync coordinator"""
+        while not self._heartbeat_stop_event.is_set():
+            try:
+                if self.sync_coordinator and self.current_sync_job_id:
+                    self.sync_coordinator.update_heartbeat(self.current_sync_job_id)
+                
+                # Wait 30 seconds between heartbeats
+                if self._heartbeat_stop_event.wait(30):
+                    break  # Stop event was set
+                    
+            except Exception as e:
+                logger.debug(f"Heartbeat error: {e}")
+                # Continue heartbeat even if there are errors
+                if self._heartbeat_stop_event.wait(30):
+                    break
+    
     def stop_sync_job(self) -> bool:
         """Stop the current Q Business data source sync job"""
         if not self.current_sync_job_id:
             print("No active sync job to stop")
             return True
         
+        print(f"🛑 Stopping Q Business sync job: {self.current_sync_job_id}")
+        
+        # Stop heartbeat thread first to prevent it from keeping the job "alive"
+        print("  📡 Stopping heartbeat thread...")
+        self._stop_heartbeat_thread()
+        
+        # Use coordinator if available
+        if self.sync_coordinator:
+            print("  🤝 Using sync coordinator to stop job...")
+            success = self.sync_coordinator.stop_sync_job_if_owner()
+            if success:
+                print("  ✅ Sync job stopped via coordinator")
+                self.current_sync_job_id = None
+                self.sync_job_started = False
+            else:
+                print("  ⚠️  Coordinator failed to stop sync job, trying direct stop...")
+                # Fall back to direct stop if coordinator fails
+                return self._direct_stop_sync_job()
+            return success
+        
+        # Fall back to direct stop
+        return self._direct_stop_sync_job()
+    
+    def _direct_stop_sync_job(self) -> bool:
+        """Directly stop the sync job via AWS API"""
         try:
-            print(f"Stopping Q Business sync job: {self.current_sync_job_id}")
+            print(f"  🔌 Directly stopping sync job via AWS API...")
             response = self.client.stop_data_source_sync_job(
                 applicationId=self.config.application_id,
                 indexId=self.config.index_id,
                 dataSourceId=self.config.data_source_id
             )
             
-            print("Sync job stopped successfully")
+            print("  ✅ Sync job stopped successfully via direct API call")
             self.current_sync_job_id = None
             self.sync_job_started = False
             return True
             
         except ClientError as e:
             error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            error_message = e.response.get('Error', {}).get('Message', str(e))
+            
+            # If the job is already stopped or doesn't exist, that's okay
+            if error_code in ['ResourceNotFoundException', 'ValidationException']:
+                print(f"  ℹ️  Sync job may have already stopped: {error_message}")
+                self.current_sync_job_id = None
+                self.sync_job_started = False
+                return True
+            
             error_msg = handle_error_securely(e, "stopping Q Business sync job")
             logger.error(f"Error stopping Q Business sync job: {error_code}")
+            print(f"  ❌ Failed to stop sync job: {error_message}")
             return False
         except Exception as e:
-            print(f"Unexpected error stopping sync job: {type(e).__name__}: {e}")
+            print(f"  ❌ Unexpected error stopping sync job: {type(e).__name__}: {e}")
             return False
     
     def has_running_sync_jobs(self) -> bool:

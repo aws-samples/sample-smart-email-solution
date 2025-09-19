@@ -40,7 +40,7 @@ A scalable Exchange Online connector that synchronizes emails to Amazon Q Busine
 ### Benefits of Continuous Running:
 1. **Always Available**: Container stays running, reducing startup overhead
 2. **Health Monitoring**: Built-in health check endpoints for monitoring
-3. **Resource Efficiency**: No container startup/shutdown overhead every 30 minutes
+3. **Resource Efficiency**: No container startup/shutdown overhead every 24 hours
 4. **Better Logging**: Continuous logging stream instead of separate job logs
 
 ### Benefits of Dynamic Table Creation:
@@ -152,7 +152,7 @@ exchange-ews-connector/
 ## Scheduling and Process Management
 
 ### Continuous Running Containers
-The application runs as a Backend Service with internal 30-minute scheduling:
+The application runs as a Backend Service with internal 24-hour scheduling:
 ```yaml
 type: Backend Service
 count: 1  # Single instance per environment
@@ -160,14 +160,14 @@ count: 1  # Single instance per environment
 
 ### Internal Scheduling Behavior
 - **Container Lifecycle**: Always running (not scheduled tasks)
-- **Sync Interval**: 30 minutes between sync operations
+- **Sync Interval**: 24 hours between sync operations
 - **Overlap Prevention**: Built-in check to prevent concurrent syncs within same container
 - **Graceful Shutdown**: Handles SIGTERM/SIGINT signals properly
 
 ### Example Process Flow
 ```
-Container Start: Health server starts → Initial sync runs → Wait 30 min → Next sync → Repeat
-If sync takes > 30 min: Next cycle waits for current sync to complete
+Container Start: Health server starts → Initial sync runs → Wait 24 hours → Next sync → Repeat
+If sync takes > 24 hours: Next cycle waits for current sync to complete
 Container Stop: Graceful shutdown → Wait for current sync → Stop health server → Exit
 ```
 
@@ -247,19 +247,19 @@ curl https://your-service-endpoint/status
 ### Small Deployment (1-5 accounts):
 - Use single container mode
 - 1 vCPU, 2 GB RAM
-- Sync every 30 minutes
+- Sync every 24 hours
 
 ### Medium Deployment (6-20 accounts):
 - Use 3 split containers
 - 1 vCPU, 2 GB RAM per container
 - 4 worker threads per container
-- Sync every 30 minutes
+- Sync every 24 hours
 
 ### Large Deployment (20+ accounts):
 - Use 5+ split containers
 - 1 vCPU, 2 GB RAM per container
 - 4 worker threads per container
-- Sync every 30 minutes (containers run continuously)
+- Sync every 24 hours (containers run continuously)
 - Monitor Q Business API limits
 
 ## Advanced Configuration

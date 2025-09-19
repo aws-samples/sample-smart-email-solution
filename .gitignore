@@ -10,3 +10,6 @@ exchange-ews-connector/*.zip
 exchange-ews-connector/config.json
 exchange-ews-connector/=*
 .repolinter.json
+.DS_Store
+exchange-ews-connector/copilot/.workspace
+exchange-ews-connector/copilot/.workspace

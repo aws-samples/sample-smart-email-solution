@@ -132,6 +132,10 @@ class Config:
         'ENABLE_THREADING': 'true',  # Enable parallel processing
         'MAX_WORKER_THREADS': '4',   # Maximum number of worker threads
         'THREAD_BATCH_SIZE': '50',   # Number of emails per thread batch
+        
+        # Distributed Sync Job Configuration
+        'SYNC_JOB_HEARTBEAT_INTERVAL': '30',  # Heartbeat interval in seconds
+        'SYNC_JOB_STALE_THRESHOLD': '600',    # Consider sync job stale after 10 minutes
     }
     
     def __init__(self):
@@ -192,6 +196,10 @@ class Config:
         self.max_worker_threads = int(os.environ.get('MAX_WORKER_THREADS', self.DEFAULT_VALUES['MAX_WORKER_THREADS']))
         self.thread_batch_size = int(os.environ.get('THREAD_BATCH_SIZE', self.DEFAULT_VALUES['THREAD_BATCH_SIZE']))
         
+        # Distributed sync job configuration
+        self.sync_job_heartbeat_interval = int(os.environ.get('SYNC_JOB_HEARTBEAT_INTERVAL', self.DEFAULT_VALUES['SYNC_JOB_HEARTBEAT_INTERVAL']))
+        self.sync_job_stale_threshold = int(os.environ.get('SYNC_JOB_STALE_THRESHOLD', self.DEFAULT_VALUES['SYNC_JOB_STALE_THRESHOLD']))
+        
         # Validate configuration
         self._validate_config()
     
@@ -233,3 +241,7 @@ class Config:
         logger.info(f"  Max Sync Conflict Retries: {self.max_sync_conflict_retries}")
         logger.info(f"  Document Batch Size: {self.document_batch_size}")
         logger.info(f"  Process Main Mailbox: {self.process_main_mailbox}")
+        logger.info(f"  Threading Enabled: {self.enable_threading}")
+        logger.info(f"  Max Worker Threads: {self.max_worker_threads}")
+        logger.info(f"  Sync Job Heartbeat Interval: {self.sync_job_heartbeat_interval}s")
+        logger.info(f"  Sync Job Stale Threshold: {self.sync_job_stale_threshold}s")

@@ -24,6 +24,7 @@ except ImportError:
 from modules.config import Config
 from modules.email_processor import EmailProcessor
 from modules.qbusiness_client import QBusinessClient
+from modules.sync_job_coordinator import SyncJobCoordinator
 from modules.security_utils import sanitize_for_logging
 from health_server import start_health_server, stop_health_server
 
@@ -107,6 +108,10 @@ def run_exchange_connector(sync_mode='delta', container_index=None, total_contai
     email_processor = EmailProcessor(config)
     qbusiness_client = QBusinessClient(config)
     
+    # Initialize sync job coordinator for distributed sync job management
+    sync_coordinator = SyncJobCoordinator(config, qbusiness_client)
+    qbusiness_client.set_sync_coordinator(sync_coordinator)
+    
     # Verify DynamoDB table is ready
     if not email_processor.dynamodb_client.verify_table_ready():
         error_msg = f'DynamoDB table {config.table_name} is not ready for use'
@@ -134,11 +139,14 @@ def run_exchange_connector(sync_mode='delta', container_index=None, total_contai
                 print("💡 Alternatively, use --force-stop flag to stop all running jobs before starting.")
                 return 1
         
-        # Start sync job once at the beginning if we expect to process any data
-        print("🚀 Starting Q Business sync job for the full sync process...")
-        sync_job_id = qbusiness_client.start_sync_job()
+        # Clean up any stale sync job registrations first
+        sync_coordinator.cleanup_stale_registrations()
+        
+        # Start or join sync job using coordinator
+        print("🚀 Starting or joining Q Business sync job for the full sync process...")
+        sync_job_id = qbusiness_client.start_sync_job_if_needed()
         if not sync_job_id:
-            error_msg = "Failed to start Q Business sync job"
+            error_msg = "Failed to start or join Q Business sync job"
             print(f"❌ {error_msg}")
             return 1
         
@@ -159,7 +167,11 @@ def run_exchange_connector(sync_mode='delta', container_index=None, total_contai
         
         # Stop sync job at the end
         print("\n🛑 Stopping Q Business sync job...")
-        qbusiness_client.stop_sync_job()
+        stop_success = qbusiness_client.stop_sync_job()
+        if stop_success:
+            print("✅ Q Business sync job stopped successfully")
+        else:
+            print("⚠️  Warning: Q Business sync job may not have stopped properly")
         
         # Print final summary
         print(f"Total emails attempted: {email_processor.emails_attempted_count}")
@@ -226,9 +238,13 @@ def run_exchange_connector(sync_mode='delta', container_index=None, total_contai
         try:
             if qbusiness_client.sync_job_started:
                 print("🛑 Attempting to stop any active sync job...")
-                qbusiness_client.stop_sync_job()
-        except:
-            pass
+                stop_success = qbusiness_client.stop_sync_job()
+                if stop_success:
+                    print("✅ Sync job stopped successfully")
+                else:
+                    print("⚠️  Warning: Sync job may not have stopped properly")
+        except Exception as stop_e:
+            print(f"⚠️  Error stopping sync job during interrupt: {stop_e}")
         return 130
         
     except Exception as e:
@@ -242,15 +258,19 @@ def run_exchange_connector(sync_mode='delta', container_index=None, total_contai
         try:
             if qbusiness_client.sync_job_started:
                 print("\n🛑 Stopping sync job due to error...")
-                qbusiness_client.stop_sync_job()
-        except:
-            pass
+                stop_success = qbusiness_client.stop_sync_job()
+                if stop_success:
+                    print("✅ Sync job stopped successfully")
+                else:
+                    print("⚠️  Warning: Sync job may not have stopped properly")
+        except Exception as stop_e:
+            print(f"⚠️  Error stopping sync job during error handling: {stop_e}")
         
         return 1
 
 class SyncScheduler:
     """
-    Scheduler that runs sync operations every 30 minutes in a continuously running container.
+    Scheduler that runs sync operations every 24 hours in a continuously running container.
     """
     
     def __init__(self):
@@ -373,9 +393,9 @@ class SyncScheduler:
         self._run_sync()
     
     def run_continuous(self):
-        """Run the scheduler continuously with 30-minute intervals."""
+        """Run the scheduler continuously with 24-hour intervals."""
         print("🚀 Starting Exchange EWS Connector Scheduler")
-        print("⏰ Sync interval: 30 minutes")
+        print("⏰ Sync interval: 24 hours")
         print("🔄 Running continuously until stopped...")
         print()
         
@@ -395,8 +415,8 @@ class SyncScheduler:
         # Main scheduler loop
         while self.running:
             try:
-                # Wait 30 minutes (1800 seconds)
-                for i in range(1800):  # 30 minutes = 1800 seconds
+                # Wait 24 hours (86400 seconds)
+                for i in range(86400):  # 24 hours = 86400 seconds
                     if not self.running:
                         break
                     time.sleep(1)
